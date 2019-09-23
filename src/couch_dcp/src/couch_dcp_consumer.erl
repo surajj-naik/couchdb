@@ -18,7 +18,7 @@
     parse_snapshot_deletion/2, parse_failover_log/1, parse_stat/4]).
 -export([encode_sasl_auth/3, encode_open_connection/3, encode_stream_request/8,
     encode_failover_log_request/2, encode_stat_request/3, encode_stream_close/2,
-    encode_select_bucket/2]).
+    encode_select_bucket/2, encode_hello/1]).
 -export([encode_noop_response/1, encode_buffer_request/2,
     encode_control_request/3, parse_all_seqs/3, encode_all_seqs_request/1]).
 
@@ -69,7 +69,9 @@ parse_header(<<?DCP_MAGIC_RESPONSE,
     ?DCP_OPCODE_DCP_CONTROL ->
         {control_request, Status, RequestId};
     ?DCP_OPCODE_SEQS ->
-        {all_seqs, Status, RequestId, BodyLength}
+        {all_seqs, Status, RequestId, BodyLength};
+    ?DCP_OPCODE_DCP_HELLO ->
+        {hello, Status, RequestId, BodyLength}
     end;
 parse_header(<<?DCP_MAGIC_REQUEST,
                Opcode,
@@ -523,3 +525,35 @@ encode_noop_response(RequestId) ->
       0:?DCP_SIZES_BODY,
       RequestId:?DCP_SIZES_OPAQUE,
       0:?DCP_SIZES_CAS>>.
+
+%HELLO comand
+%Field        (offset) (value)
+%Magic        (0)    : 0x80
+%Opcode       (1)    : 0x1F
+%Key length   (2,3)  : 0x000C
+%Extra length (4)    : 0x00
+%Data type    (5)    : 0x00
+%Vbucket      (6,7)  : 0x0000
+%Total body   (8-11) : 0x0000000E
+%Opaque       (12-15): 0x00000000
+%CAS          (16-23): 0x0000000000000000
+%Key          (24-35): "mchello v1.0"
+%Body                :
+%             (36-37): Collections (0x0012)
+
+-spec encode_hello(request_id()) -> binary().
+encode_hello(RequestId) ->
+    KeyLength = 12,
+	ExtraLength = 0,
+	Header = <<?DCP_MAGIC_REQUEST,
+			    ?DCP_OPCODE_DCP_HELLO,
+				KeyLength:?DCP_SIZES_KEY_LENGTH,
+				ExtraLength,
+				0,
+				0:?DCP_SIZES_PARTITION,
+				16#E:32,
+				RequestId:?DCP_SIZES_OPAQUE,
+				0:?DCP_SIZES_CAS,
+				"mchello v1.0",
+				0,16#12>>,
+	Header.

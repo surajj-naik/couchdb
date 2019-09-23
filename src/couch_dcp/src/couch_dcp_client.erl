@@ -308,45 +308,50 @@ init([Name, Bucket, AdmUser, AdmPasswd, BufferSize, Flags]) ->
             timeout = DcpTimeout,
             request_id = 0
         },
+        case enable_collection(State) of
+        {ok, State1} ->
         % Auth as admin and select bucket for the connection
-        case sasl_auth(AdmUser, AdmPasswd, State) of
-        {ok, State2} ->
-            case select_bucket(Bucket, State2) of
-            {ok, State3} ->
-                % Store the meta information to reconnect
-                Args = [Name, Bucket, AdmUser, AdmPasswd, BufferSize, Flags],
-                State4 = State3#state{args = Args},
-                case open_connection(Name, Flags, State4) of
-                {ok, State5} ->
-                    Parent = self(),
-                    process_flag(trap_exit, true),
-                    #state{bufsocket = BufSocket2} = State5,
-                    WorkerPid = spawn_link(
-                        fun() ->
-                            receive_worker(BufSocket2, DcpTimeout, Parent, [])
-                        end),
-                    gen_tcp:controlling_process(?SOCKET(BufSocket), WorkerPid),
-                    case set_buffer_size(State5, BufferSize) of
-                    {ok, State6} ->
-                            case enable_noop(State6, true) of
-                                {ok, State7} ->
-                                    case State7#state.noop_enable of
-                                    true ->
-                                        case noop_interval(State7) of
-                                        {ok, State8} ->
-                                            {ok, State8#state{worker_pid = WorkerPid}};
-                                        {error, Reason} ->
+            case sasl_auth(AdmUser, AdmPasswd, State1) of
+            {ok, State2} ->
+                case select_bucket(Bucket, State2) of
+                {ok, State3} ->
+                    % Store the meta information to reconnect
+                    Args = [Name, Bucket, AdmUser, AdmPasswd, BufferSize, Flags],
+                    State4 = State3#state{args = Args},
+                    case open_connection(Name, Flags, State4) of
+                    {ok, State5} ->
+                        Parent = self(),
+                        process_flag(trap_exit, true),
+                        #state{bufsocket = BufSocket2} = State5,
+                        WorkerPid = spawn_link(
+                            fun() ->
+                                receive_worker(BufSocket2, DcpTimeout, Parent, [])
+                            end),
+                        gen_tcp:controlling_process(?SOCKET(BufSocket), WorkerPid),
+                        case set_buffer_size(State5, BufferSize) of
+                        {ok, State6} ->
+                                case enable_noop(State6, true) of
+                                    {ok, State7} ->
+                                        case State7#state.noop_enable of
+                                        true ->
+                                            case noop_interval(State7) of
+                                            {ok, State8} ->
+                                                {ok, State8#state{worker_pid = WorkerPid}};
+                                            {error, Reason} ->
+                                                exit(WorkerPid, shutdown),
+                                                {stop, Reason}
+                                            end;
+                                        false ->
                                             exit(WorkerPid, shutdown),
-                                            {stop, Reason}
+                                            {stop, noop_not_enabled}
                                         end;
-                                    false ->
+                                    {error, Reason} ->
                                         exit(WorkerPid, shutdown),
-                                        {stop, noop_not_enabled}
-                                    end;
-                                {error, Reason} ->
-                                    exit(WorkerPid, shutdown),
-                                    {stop, Reason}
-                            end;
+                                        {stop, Reason}
+                                end;
+                        {error, Reason} ->
+                            {stop, Reason}
+                        end;
                     {error, Reason} ->
                         {stop, Reason}
                     end;
@@ -1656,3 +1661,59 @@ store_snapshot_mutation(RequestId, Data, State) ->
                                                 {atom(), tuple | #dcp_doc{}}.
 remove_body_len({Type, Data, _BodyLength}) ->
     {Type, Data}.
+
+% Enables collection by sending a hello message with 0x0012 flag set
+-spec enable_collection(#state{}) -> {ok, #state{}} | {error, term()}.
+enable_collection(State) ->
+    #state{
+        bufsocket = BufSocket,
+        timeout = DcpTimeout,
+        request_id = RequestId
+    } = State,
+    EnableCollection = couch_dcp_consumer:encode_hello(RequestId),
+    case bufsocket_send(BufSocket, EnableCollection) of
+    ok ->
+        case bufsocket_recv(BufSocket, ?DCP_HEADER_LEN, DcpTimeout) of
+        {ok, Header, BufSocket2} ->
+            {hello, Status, RequestId, BodyLength} =
+                                    couch_dcp_consumer:parse_header(Header),
+            case Status of
+            ?DCP_STATUS_OK ->
+                case BodyLength of
+                % The response either contains the body of length 2 specifying
+                % collections are enabled or the body is not sent specifying
+                % collections are not supported.
+                2 ->
+                    {ok, _, BufSocket3} = bufsocket_recv(BufSocket2, BodyLength, DcpTimeout),
+                    {ok, State#state{
+                        request_id = RequestId + 1,
+                        bufsocket = BufSocket3
+                    }};
+                _ ->
+                    ?LOG_ERROR("dcp client: Collections not supported by producer", []),
+                    {ok, State#state{
+                        request_id = RequestId + 1,
+                        bufsocket = BufSocket2
+                    }}
+                end;
+            _ ->
+                % In case of error, the error response is parsed
+                case parse_error_response(
+                        BufSocket2, DcpTimeout, BodyLength, Status) of
+                % Case where the asked feature is not supported
+                {{error, not_supported}, BufSocket3} ->
+                    {ok, State#state{
+                        request_id = RequestId + 1,
+                        bufsocket = BufSocket3
+                    }};
+                % Case to handle every other error
+                {{error, _}, _} = Error ->
+                    Error
+                end
+            end;
+        {error, _} = Error ->
+            Error
+        end;
+    {error, _} = Error ->
+        Error
+    end.
